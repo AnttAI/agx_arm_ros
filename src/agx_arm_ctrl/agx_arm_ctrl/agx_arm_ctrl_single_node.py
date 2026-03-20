@@ -837,6 +837,7 @@ class AgxArmRosNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+    node = None
 
     try:
         node = AgxArmRosNode()
@@ -846,7 +847,10 @@ def main(args=None):
     except Exception as e:
         print(f"Error occurred: {e}")
     finally:
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
