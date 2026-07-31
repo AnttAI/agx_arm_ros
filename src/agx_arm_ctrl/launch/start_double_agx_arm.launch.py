@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -120,12 +121,48 @@ def generate_launch_description():
         description="Logging level (debug, info, warn, error, fatal).",
     )
 
+    base_arguments = [
+        DeclareLaunchArgument(
+            "start_tara_base",
+            default_value="True",
+            description="Start the Tara wheel-base ROS node.",
+        ),
+        DeclareLaunchArgument("base_serial_port", default_value="/dev/ttyUSB0"),
+        DeclareLaunchArgument("base_slave_id", default_value="1"),
+        DeclareLaunchArgument("base_baudrate", default_value="115200"),
+        DeclareLaunchArgument("base_wheel_radius_m", default_value="0.10"),
+        DeclareLaunchArgument("base_wheel_separation_m", default_value="0.157"),
+        DeclareLaunchArgument("base_max_abs_rpm", default_value="30.0"),
+        DeclareLaunchArgument("base_command_timeout_s", default_value="0.5"),
+    ]
+
+    base_node = Node(
+        package="tara_base_ctrl",
+        executable="tara_base_node",
+        name="tara_base",
+        namespace="base",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("start_tara_base")),
+        ros_arguments=["--log-level", LaunchConfiguration("log_level")],
+        parameters=[{
+            "serial_port": LaunchConfiguration("base_serial_port"),
+            "slave_id": LaunchConfiguration("base_slave_id"),
+            "baudrate": LaunchConfiguration("base_baudrate"),
+            "wheel_radius_m": LaunchConfiguration("base_wheel_radius_m"),
+            "wheel_separation_m": LaunchConfiguration("base_wheel_separation_m"),
+            "max_abs_rpm": LaunchConfiguration("base_max_abs_rpm"),
+            "command_timeout_s": LaunchConfiguration("base_command_timeout_s"),
+        }],
+    )
+
     return LaunchDescription(
         [log_level_arg]
         + _declare_arm_arguments("left")
         + _declare_arm_arguments("right")
+        + base_arguments
         + [
             _make_arm_node("left"),
             _make_arm_node("right"),
+            base_node,
         ]
     )
