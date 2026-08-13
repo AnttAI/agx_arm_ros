@@ -131,7 +131,7 @@ def generate_launch_description():
         DeclareLaunchArgument("base_slave_id", default_value="1"),
         DeclareLaunchArgument("base_baudrate", default_value="115200"),
         DeclareLaunchArgument("base_wheel_radius_m", default_value="0.10"),
-        DeclareLaunchArgument("base_wheel_separation_m", default_value="0.157"),
+        DeclareLaunchArgument("base_wheel_separation_m", default_value="0.38"),
         DeclareLaunchArgument("base_max_abs_rpm", default_value="30.0"),
         DeclareLaunchArgument("base_command_timeout_s", default_value="0.5"),
     ]
@@ -155,14 +155,49 @@ def generate_launch_description():
         }],
     )
 
+    lift_arguments = [
+        DeclareLaunchArgument(
+            "start_lift",
+            default_value="True",
+            description="Start the lift ROS node.",
+        ),
+        DeclareLaunchArgument(
+            "lift_serial_port",
+            default_value="",
+            description="Serial port for the lift, for example /dev/ttyUSB1.",
+        ),
+        DeclareLaunchArgument("lift_min_height", default_value="60.0"),
+        DeclareLaunchArgument("lift_max_height", default_value="120.0"),
+        DeclareLaunchArgument("lift_tolerance", default_value="1.0"),
+        DeclareLaunchArgument("lift_wake_timeout_seconds", default_value="30.0"),
+    ]
+
+    lift_node = Node(
+        package="lift",
+        executable="lift_node",
+        name="lift",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("start_lift")),
+        ros_arguments=["--log-level", LaunchConfiguration("log_level")],
+        parameters=[{
+            "serial_port": LaunchConfiguration("lift_serial_port"),
+            "min_height": LaunchConfiguration("lift_min_height"),
+            "max_height": LaunchConfiguration("lift_max_height"),
+            "tolerance": LaunchConfiguration("lift_tolerance"),
+            "wake_timeout_seconds": LaunchConfiguration("lift_wake_timeout_seconds"),
+        }],
+    )
+
     return LaunchDescription(
         [log_level_arg]
         + _declare_arm_arguments("left")
         + _declare_arm_arguments("right")
         + base_arguments
+        + lift_arguments
         + [
             _make_arm_node("left"),
             _make_arm_node("right"),
             base_node,
+            lift_node,
         ]
     )

@@ -19,6 +19,8 @@ from std_srvs.srv import SetBool, Trigger
 
 TARA_ENCODER_COUNTS_PER_WHEEL_REVOLUTION = 4096
 ENCODER_TURN_TIMEOUT_S = 8.0
+ENCODER_TRACKING_KP_RPM_PER_REV = 18.0
+ENCODER_TRACKING_MAX_CORRECTION_RPM = 8.0
 
 
 class TaraBaseNode(Node):
@@ -292,6 +294,15 @@ class TaraBaseNode(Node):
         right_counts = abs(self._signed_32_bit_delta(current[1], start[1]))
         return 0.5 * (left_counts + right_counts) / TARA_ENCODER_COUNTS_PER_WHEEL_REVOLUTION
 
+    def _encoder_logical_revolutions(self, start: tuple[int, int]) -> tuple[float, float]:
+        current = self._encoder_positions()
+        left_counts = self._signed_32_bit_delta(current[0], start[0])
+        right_counts = self._signed_32_bit_delta(current[1], start[1])
+        return (
+            left_counts * self._left_sign / TARA_ENCODER_COUNTS_PER_WHEEL_REVOLUTION,
+            right_counts * self._right_sign / TARA_ENCODER_COUNTS_PER_WHEEL_REVOLUTION,
+        )
+
     def _stop_csv_hardware(self) -> None:
         with self._lock:
             if self._base is not None:
@@ -322,8 +333,16 @@ class TaraBaseNode(Node):
             start_index = int(options.get("start_index", 0))
             reverse_playback = bool(options.get("reverse_playback", False))
             fit_to_limit = bool(options.get("fit_to_rpm_limit", True))
+            encoder_track = bool(options.get("encoder_track", False))
+            encoder_kp = float(options.get("encoder_kp", ENCODER_TRACKING_KP_RPM_PER_REV))
+            encoder_max_correction = float(
+                options.get("encoder_max_correction_rpm", ENCODER_TRACKING_MAX_CORRECTION_RPM)
+            )
+            swap_wheels = bool(options.get("swap_wheels", True))
             if fps <= 0.0 or speed_scale <= 0.0 or max_abs_rpm <= 0.0:
                 raise ValueError("fps, speed_scale, and max_abs_rpm must be positive")
+            if encoder_kp < 0.0 or encoder_max_correction < 0.0:
+                raise ValueError("encoder_kp and encoder_max_correction_rpm must be non-negative")
 
             if reverse_playback:
                 commands = [
@@ -366,6 +385,9 @@ class TaraBaseNode(Node):
             encoder_drive_rpm: tuple[float, float] | None = None
             encoder_action: str | None = None
             encoder_revolutions = 0.0
+            tracking_start: tuple[int, int] | None = self._encoder_positions() if encoder_track else None
+            expected_left_rev = 0.0
+            expected_right_rev = 0.0
             stream_start = time.monotonic()
             last_progress_publish_time = 0.0
 
@@ -378,6 +400,8 @@ class TaraBaseNode(Node):
                 action = str(command["action"])
                 target = command["encoder_target"]
                 encoder_controlled = (
+                    not encoder_track
+                    and
                     not reverse_playback
                     and action in {"turn_left_90", "turn_right_90"}
                     and target is not None
@@ -418,11 +442,34 @@ class TaraBaseNode(Node):
                     -max_abs_rpm,
                     min(max_abs_rpm, csv_right * speed_scale * effective_playback_speed),
                 )
-                # Exactly match stream_wheel_commands(invert_turn_direction=True):
-                # swap logical wheels, then _set_logical_wheel_rpm applies the
-                # physical motor signs (+1 left, -1 right).
-                if not self._set_logical_wheel_rpm(scaled_right, scaled_left):
+                if encoder_track and tracking_start is not None:
+                    actual_left_rev, actual_right_rev = self._encoder_logical_revolutions(tracking_start)
+                    left_error = expected_left_rev - actual_left_rev
+                    right_error = expected_right_rev - actual_right_rev
+                    left_correction = max(
+                        -encoder_max_correction,
+                        min(encoder_max_correction, encoder_kp * left_error),
+                    )
+                    right_correction = max(
+                        -encoder_max_correction,
+                        min(encoder_max_correction, encoder_kp * right_error),
+                    )
+                    scaled_left = max(-max_abs_rpm, min(max_abs_rpm, scaled_left + left_correction))
+                    scaled_right = max(-max_abs_rpm, min(max_abs_rpm, scaled_right + right_correction))
+                if swap_wheels:
+                    # Exactly match stream_wheel_commands(invert_turn_direction=True):
+                    # swap logical wheels, then _set_logical_wheel_rpm applies the
+                    # physical motor signs (+1 left, -1 right).
+                    command_left = scaled_right
+                    command_right = scaled_left
+                else:
+                    command_left = scaled_left
+                    command_right = scaled_right
+                if not self._set_logical_wheel_rpm(command_left, command_right):
                     raise RuntimeError(f"set_velocity failed at frame {command['frame']}")
+                if encoder_track:
+                    expected_left_rev += command_left * dt / 60.0
+                    expected_right_rev += command_right * dt / 60.0
                 now = time.monotonic()
                 if now - last_progress_publish_time >= 0.2 or index + 1 == total:
                     self._publish_csv_status(
