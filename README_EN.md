@@ -218,6 +218,21 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py can_port:=can0 ar
 
 > This launch file starts both the arm control node and MoveIt2 simultaneously, automatically connecting joint feedback (`/feedback/joint_states`) to MoveIt. No need to start two terminals separately. Supports all `agx_arm_ctrl` parameters (e.g. `tcp_offset`, `speed_percent`, etc.). See [Moveit](./src/agx_arm_moveit/README_EN.md) for details.
 
+**Double Nero Arms + Tara Base + Lift Launch:**
+
+```bash
+ros2 launch agx_arm_ctrl start_double_agx_arm.launch.py \
+  left_can_port:=can_arm1 \
+  right_can_port:=can_arm2 \
+  left_arm_type:=nero \
+  right_arm_type:=nero \
+  left_speed_percent:=20 \
+  right_speed_percent:=20 \
+  left_effector_type:=agx_gripper \
+  right_effector_type:=agx_gripper \
+  base_serial_port:=/dev/ttyUSB1 \
+  lift_serial_port:=/dev/ttyUSB0
+```
 ### Launch Parameters
 
 | Parameter | Default | Description | Options |
