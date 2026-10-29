@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'agx_arm_ctrl_single = agx_arm_ctrl.agx_arm_ctrl_single_node:main',
+            'double_arm_feedback_subscriber = agx_arm_ctrl.double_arm_feedback_subscriber:main',
         ],
     },
 )
