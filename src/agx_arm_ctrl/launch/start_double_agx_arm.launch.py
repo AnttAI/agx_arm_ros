@@ -3,6 +3,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 import os
 
@@ -11,6 +12,16 @@ os.environ["RCUTILS_COLORIZED_OUTPUT"] = "1"
 
 def _declare_arm_arguments(side: str):
     return [
+        DeclareLaunchArgument(
+            f"{side}_joint1_command_correction",
+            default_value="True" if side == "left" else "False",
+            description="Correct incoming joint-position J1 and reject corrected targets outside +/-157 degrees.",
+        ),
+        DeclareLaunchArgument(
+            f"{side}_joint1_offset_deg",
+            default_value="-2.0" if side == "left" else "0.0",
+            description="Signed J1 command correction in degrees; ROS positions remain radians.",
+        ),
         DeclareLaunchArgument(
             f"{side}_can_port",
             default_value="can0" if side == "left" else "can1",
@@ -93,6 +104,10 @@ def _make_arm_node(side: str):
         output="screen",
         ros_arguments=["--log-level", LaunchConfiguration("log_level")],
         parameters=[{
+            "joint1_command_correction": ParameterValue(
+                LaunchConfiguration(f"{side}_joint1_command_correction"), value_type=bool),
+            "joint1_offset_deg": ParameterValue(
+                LaunchConfiguration(f"{side}_joint1_offset_deg"), value_type=float),
             "can_port": LaunchConfiguration(f"{side}_can_port"),
             "pub_rate": LaunchConfiguration(f"{side}_pub_rate"),
             "auto_enable": LaunchConfiguration(f"{side}_auto_enable"),

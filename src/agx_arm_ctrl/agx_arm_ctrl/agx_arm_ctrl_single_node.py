@@ -102,6 +102,11 @@ class AgxArmRosNode(Node):
         self.declare_parameter("effector_type", "none")
         self.declare_parameter("tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("publish_gripper_joint", True)
+        self.declare_parameter("smooth_mode", False)
+        self.declare_parameter("smooth_max_velocity", 0.4)
+        self.declare_parameter("smooth_max_acceleration", 1.0)
+        self.declare_parameter("joint1_command_correction", False)
+        self.declare_parameter("joint1_offset_deg", 0.0)
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -115,6 +120,14 @@ class AgxArmRosNode(Node):
         self.effector_type = self.get_parameter("effector_type").value
         self.tcp_offset = self.get_parameter("tcp_offset").value
         self.publish_gripper_joint = self.get_parameter("publish_gripper_joint").value
+        self.smooth_mode = self.get_parameter("smooth_mode").value
+        self.smooth_max_velocity = float(self.get_parameter("smooth_max_velocity").value)
+        self.smooth_max_acceleration = float(self.get_parameter("smooth_max_acceleration").value)
+        self.joint1_command_correction = bool(self.get_parameter("joint1_command_correction").value)
+        self.joint1_offset_deg = float(self.get_parameter("joint1_offset_deg").value)
+        if not math.isfinite(self.joint1_offset_deg):
+            raise ValueError("joint1_offset_deg must be finite")
+        self.joint1_offset_rad = math.radians(self.joint1_offset_deg)
 
     def _log_parameters(self):
         self.get_logger().info(f"can_port: {self.can_port}")
@@ -127,6 +140,13 @@ class AgxArmRosNode(Node):
         self.get_logger().info(f"payload: {self.payload}")
         self.get_logger().info(f"effector_type: {self.effector_type}")
         self.get_logger().info(f"tcp_offset: {self.tcp_offset}")
+        self.get_logger().info(f"smooth_mode: {self.smooth_mode}")
+        self.get_logger().info(f"smooth_max_velocity: {self.smooth_max_velocity}")
+        self.get_logger().info(f"smooth_max_acceleration: {self.smooth_max_acceleration}")
+        self.get_logger().info(
+            f"J1 command correction: enabled={self.joint1_command_correction}, "
+            f"offset={self.joint1_offset_deg} deg ({self.joint1_offset_rad} rad), "
+            "corrected limits=[-157, +157] deg")
 
     def _init_agx_arm(self):
         config: PiperCanDefaultConfig = create_agx_arm_config(
@@ -142,6 +162,9 @@ class AgxArmRosNode(Node):
         self.agx_arm.set_tcp_offset(self.tcp_offset)
         self.is_mit_mode = False
         self.is_switch_seamlessly = True
+        self._smooth_joints = None
+        self._smooth_velocity = None
+        self._smooth_last_time = None
         if self.is_piper:
             self.agx_arm.set_installation_pos(self.installation_pos)
             self.agx_arm.set_payload(self.payload)
@@ -541,6 +564,100 @@ class AgxArmRosNode(Node):
             self._publish_hand_status()
 
     ### arm control callbacks
+    def _read_joint_positions(self, msg, require_arm=False):
+        joint_pos = {}
+        for idx, name in enumerate(msg.name):
+            if name in self.arm_joint_names:
+                if idx >= len(msg.position) or not math.isfinite(msg.position[idx]):
+                    self.get_logger().error(f"Rejected joint command: missing/non-finite {name}")
+                    return None
+                joint_pos[name] = float(msg.position[idx])
+            else:
+                joint_pos[name] = self._safe_get_value(msg.position, idx)
+        if require_arm and not any(name in joint_pos for name in self.arm_joint_names):
+            self.get_logger().error("Rejected joint command: arm positions are missing")
+            return None
+        if (self.joint1_command_correction
+                and any(name in joint_pos for name in self.arm_joint_names)
+                and self.arm_joint_names[0] not in joint_pos):
+            self.get_logger().error("Rejected joint command: J1 position is missing")
+            return None
+        return joint_pos
+
+    def _validate_corrected_joint1(self, joints):
+        if not self.joint1_command_correction:
+            return True
+        limit = math.radians(157.0)
+        value = float(joints[0])
+        if not math.isfinite(value) or not -limit <= value <= limit:
+            self.get_logger().error(
+                f"Rejected joint command: corrected J1={math.degrees(value):.9f} deg "
+                "is outside [-157, +157] deg; not sent to arm driver")
+            return False
+        return True
+
+    def _prepare_joint_target(self, joints):
+        target = list(joints)
+        if self.joint1_command_correction:
+            target[0] = float(target[0]) + self.joint1_offset_rad
+        # Validate before updating smoothing state or sending any arm command.
+        if not self._validate_corrected_joint1(target):
+            return None
+        target = self._smooth_joint_target(target)
+        # The acceleration-limited smoother can overshoot even valid targets.
+        if not self._validate_corrected_joint1(target):
+            self._smooth_joints = self._smooth_velocity = self._smooth_last_time = None
+            return None
+        return target
+
+    def _smooth_joint_target(self, joints):
+        if not self.smooth_mode:
+            return joints
+
+        now = time.monotonic()
+        target = [float(joint) for joint in joints]
+
+        if (
+            self._smooth_joints is None
+            or self._smooth_velocity is None
+            or self._smooth_last_time is None
+            or len(self._smooth_joints) != len(target)
+        ):
+            current = self.agx_arm.get_joint_angles()
+            if current is not None and len(current.msg) == len(target):
+                self._smooth_joints = [float(joint) for joint in current.msg]
+            else:
+                self._smooth_joints = target[:]
+            self._smooth_velocity = [0.0] * len(target)
+            self._smooth_last_time = now
+
+        dt = max(now - self._smooth_last_time, 1e-3)
+        max_velocity = max(abs(self.smooth_max_velocity), 1e-6)
+        max_acceleration = max(abs(self.smooth_max_acceleration), 1e-6)
+        max_delta_velocity = max_acceleration * dt
+
+        smoothed = []
+        new_velocity = []
+        for current, velocity, desired in zip(
+            self._smooth_joints, self._smooth_velocity, target
+        ):
+            desired_velocity = (desired - current) / dt
+            desired_velocity = max(
+                -max_velocity,
+                min(max_velocity, desired_velocity),
+            )
+            limited_velocity = max(
+                velocity - max_delta_velocity,
+                min(velocity + max_delta_velocity, desired_velocity),
+            )
+            smoothed.append(current + limited_velocity * dt)
+            new_velocity.append(limited_velocity)
+
+        self._smooth_joints = smoothed
+        self._smooth_velocity = new_velocity
+        self._smooth_last_time = now
+        return smoothed
+
     def _control_arm_joints(self, joint_pos):
         arm_joints = {
             name : value
@@ -549,8 +666,12 @@ class AgxArmRosNode(Node):
         }
         if arm_joints:
             joints = [arm_joints.get(name, 0) for name in self.arm_joint_names]
+            joints = self._prepare_joint_target(joints)
+            if joints is None:
+                return False
             self.agx_arm.move_j(joints)
             self.is_mit_mode = False
+        return True
 
     def _control_gripper_joint(self, joint_pos, joint_effort):
         if self.gripper is None:
@@ -608,15 +729,15 @@ class AgxArmRosNode(Node):
         if not self._check_can_control():
             return
 
-        joint_pos = {
-            name: self._safe_get_value(msg.position, idx)
-            for idx, name in enumerate(msg.name)
-        }
+        joint_pos = self._read_joint_positions(msg)
+        if joint_pos is None:
+            return
         joint_effort = {
             name: self._safe_get_value(msg.effort, idx)
             for idx, name in enumerate(msg.name)
         }
-        self._control_arm_joints(joint_pos)
+        if not self._control_arm_joints(joint_pos):
+            return
         self._control_gripper_joint(joint_pos, joint_effort)
         self._control_hand_joints(joint_pos)
 
@@ -624,10 +745,13 @@ class AgxArmRosNode(Node):
         if not self._check_can_control():
             return
 
-        joint_pos = {}
-        for idx, joint_name in enumerate(msg.name):
-            joint_pos[joint_name] = self._safe_get_value(msg.position, idx)
+        joint_pos = self._read_joint_positions(msg, require_arm=True)
+        if joint_pos is None:
+            return
         joints = [joint_pos.get(i, 0) for i in self.arm_joint_names]
+        joints = self._prepare_joint_target(joints)
+        if joints is None:
+            return
         self.agx_arm.move_j(joints)
         self.is_mit_mode = False
 
@@ -666,10 +790,13 @@ class AgxArmRosNode(Node):
         if not self._check_can_control():
             return
 
-        joint_pos = {}
-        for idx, joint_name in enumerate(msg.name):
-            joint_pos[joint_name] = self._safe_get_value(msg.position, idx)
+        joint_pos = self._read_joint_positions(msg, require_arm=True)
+        if joint_pos is None:
+            return
         joints = [joint_pos.get(i, 0) for i in self.arm_joint_names]
+        joints = self._prepare_joint_target(joints)
+        if joints is None:
+            return
         self.agx_arm.move_js(joints)
         self.is_mit_mode = True
 
